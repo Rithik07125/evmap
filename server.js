@@ -53,9 +53,18 @@ const E2GO_CENTRES = [
 ];
 
 // ---- Cache ----
+// All operators are cached and refreshed in the background, so requests to /ion,
+// /uaev, /zynetic, /dewa, /e2go always return instantly from memory instead of
+// making the visitor wait on the upstream operator API's own response time.
 let e2goCache = null;
 let e2goLastFetch = 0;
 const E2GO_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+let ionCache = null;
+let uaevCache = null;
+let zyneticCache = null;
+let dewaCache = null;
+const FAST_CACHE_TTL = 30 * 1000; // 30 seconds — matches the map's own refresh interval
 
 function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
 
@@ -203,6 +212,18 @@ sweepE2go();
 // Re-sweep every 5 minutes to keep status fresh
 setInterval(sweepE2go, E2GO_CACHE_TTL);
 
+// Keep ION, UAEV, Zynetic, DEWA warm in the background so every visitor request
+// is served instantly from cache instead of waiting on the live upstream call.
+async function refreshFastCaches() {
+  const [ion, uaev, zynetic, dewa] = await Promise.all([fetchIon(), fetchUaev(), fetchZynetic(), fetchDewa()]);
+  if (ion !== null) ionCache = ion;
+  if (uaev !== null) uaevCache = uaev;
+  if (zynetic !== null) zyneticCache = zynetic;
+  if (dewa !== null) dewaCache = dewa;
+}
+refreshFastCaches(); // populate immediately on boot
+setInterval(refreshFastCaches, FAST_CACHE_TTL);
+
 // ---- Daily snapshots (for the /updates endpoint) ----
 async function takeSnapshot() {
   const date = todayDateStr();
@@ -213,7 +234,11 @@ async function takeSnapshot() {
   }
   console.log(`SNAPSHOT: taking snapshot for ${date}...`);
   const [ion, uaev, e2go, zynetic, dewa] = await Promise.all([
-    fetchIon(), fetchUaev(), getE2go(), fetchZynetic(), fetchDewa()
+    ionCache !== null ? Promise.resolve(ionCache) : fetchIon(),
+    uaevCache !== null ? Promise.resolve(uaevCache) : fetchUaev(),
+    getE2go(),
+    zyneticCache !== null ? Promise.resolve(zyneticCache) : fetchZynetic(),
+    dewaCache !== null ? Promise.resolve(dewaCache) : fetchDewa()
   ]);
   const snapshot = {
     date,
@@ -372,12 +397,12 @@ http.createServer(async (req, res) => {
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
   if (req.url.startsWith('/ion')) {
-    const data = await fetchIon();
+    const data = ionCache !== null ? ionCache : await fetchIon();
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(data));
 
   } else if (req.url.startsWith('/uaev')) {
-    const data = await fetchUaev();
+    const data = uaevCache !== null ? uaevCache : await fetchUaev();
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(data));
 
@@ -387,12 +412,12 @@ http.createServer(async (req, res) => {
     res.end(JSON.stringify(data));
 
   } else if (req.url.startsWith('/zynetic')) {
-    const data = await fetchZynetic();
+    const data = zyneticCache !== null ? zyneticCache : await fetchZynetic();
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(data));
 
   } else if (req.url.startsWith('/dewa')) {
-    const data = await fetchDewa();
+    const data = dewaCache !== null ? dewaCache : await fetchDewa();
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(data));
 
@@ -409,7 +434,14 @@ http.createServer(async (req, res) => {
   } else if (req.url.startsWith('/health')) {
     // Health check endpoint for uptime pings / Railway
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', e2goCacheAge: e2goLastFetch ? Date.now() - e2goLastFetch : null }));
+    res.end(JSON.stringify({
+      status: 'ok',
+      e2goCacheAge: e2goLastFetch ? Date.now() - e2goLastFetch : null,
+      ionCached: ionCache !== null,
+      uaevCached: uaevCache !== null,
+      zyneticCached: zyneticCache !== null,
+      dewaCached: dewaCache !== null
+    }));
 
   } else if (req.url.startsWith('/updates')) {
     const url = new URL(req.url, `http://localhost`);
