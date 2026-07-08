@@ -59,6 +59,72 @@ const E2GO_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
 function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+// ---- Snapshots (for the /updates feature: new/removed stations day over day) ----
+// NOTE: Railway's default filesystem resets on every redeploy. Snapshot history
+// survives restarts of the SAME deployment, but if you push new code, this folder
+// is wiped and history starts over. To persist across deploys, add a Railway
+// Volume mounted at this path (Project → Service → Settings → Volumes).
+const SNAPSHOTS_DIR = path.join(__dirname, 'snapshots');
+try { fs.mkdirSync(SNAPSHOTS_DIR, { recursive: true }); } catch (e) {}
+
+const SNAPSHOT_RETENTION_DAYS = 30;
+// Hour (UTC) to take the daily snapshot. Default corresponds to 3:00 PM Gulf Standard Time (UTC+4).
+const SNAPSHOT_HOUR_UTC = Number(process.env.SNAPSHOT_HOUR_UTC || 11);
+
+function todayDateStr() {
+  return new Date().toISOString().slice(0, 10); // YYYY-MM-DD (UTC)
+}
+
+// Best-effort extraction of a stable list of {id, name, lat, lng} per operator.
+// These shapes are inferred from what each API has been observed to return —
+// if an operator's real shape differs, ids may come back empty for that operator.
+// Check /updates output's "counts" field to sanity-check extraction is working.
+function extractIds(operator, raw) {
+  if (!raw) return [];
+  try {
+    switch (operator) {
+      case 'ion': {
+        const arr = Array.isArray(raw) ? raw : (raw.data || raw.sites || raw.chargeSites || []);
+        return arr
+          .map(s => ({ id: String(s.id ?? s.siteId ?? ''), name: s.title || s.name || '', lat: s.latitude, lng: s.longitude }))
+          .filter(x => x.id);
+      }
+      case 'e2go': {
+        const arr = raw.locations || [];
+        return arr
+          .map(l => ({ id: String(l.id ?? ''), name: l.name || '', lat: l.coordinates?.lat, lng: l.coordinates?.long }))
+          .filter(x => x.id);
+      }
+      case 'uaev': {
+        // raw here is already result.locations from fetchUaev()
+        if (Array.isArray(raw)) {
+          return raw.map(l => ({ id: String(l.id ?? ''), name: l.name || l.title || '', lat: l.latitude, lng: l.longitude })).filter(x => x.id);
+        }
+        if (raw && typeof raw === 'object') {
+          return Object.entries(raw).map(([k, v]) => ({ id: String(k), name: v?.name || v?.title || '', lat: v?.latitude, lng: v?.longitude }));
+        }
+        return [];
+      }
+      case 'zynetic': {
+        const arr = raw.locations || raw.data || (Array.isArray(raw) ? raw : []);
+        return arr
+          .map(l => ({ id: String(l.id ?? l.locationId ?? ''), name: l.name || l.title || '', lat: l.latitude ?? l.lat, lng: l.longitude ?? l.lng }))
+          .filter(x => x.id);
+      }
+      case 'dewa': {
+        const arr = raw.Data || raw.data || (Array.isArray(raw) ? raw : []);
+        return arr
+          .map((l, i) => ({ id: String(l.Id ?? l.id ?? i), name: l.Name || l.name || '', lat: l.Latitude ?? l.latitude, lng: l.Longitude ?? l.longitude }))
+          .filter(x => x.id);
+      }
+      default:
+        return [];
+    }
+  } catch (e) {
+    return [];
+  }
+}
+
 // ---- Helpers ----
 function httpsGet(url, headers) {
   return new Promise((resolve) => {
@@ -136,6 +202,98 @@ async function getE2go() {
 sweepE2go();
 // Re-sweep every 5 minutes to keep status fresh
 setInterval(sweepE2go, E2GO_CACHE_TTL);
+
+// ---- Daily snapshots (for the /updates endpoint) ----
+async function takeSnapshot() {
+  const date = todayDateStr();
+  const filePath = path.join(SNAPSHOTS_DIR, `${date}.json`);
+  if (fs.existsSync(filePath)) {
+    console.log(`SNAPSHOT: ${date} already exists, skipping`);
+    return;
+  }
+  console.log(`SNAPSHOT: taking snapshot for ${date}...`);
+  const [ion, uaev, e2go, zynetic, dewa] = await Promise.all([
+    fetchIon(), fetchUaev(), getE2go(), fetchZynetic(), fetchDewa()
+  ]);
+  const snapshot = {
+    date,
+    takenAt: new Date().toISOString(),
+    operators: {
+      ion: extractIds('ion', ion),
+      uaev: extractIds('uaev', uaev),
+      e2go: extractIds('e2go', e2go),
+      zynetic: extractIds('zynetic', zynetic),
+      dewa: extractIds('dewa', dewa),
+    }
+  };
+  try {
+    fs.writeFileSync(filePath, JSON.stringify(snapshot));
+    console.log(`SNAPSHOT: saved ${date} — ` + Object.entries(snapshot.operators).map(([k, v]) => `${k}:${v.length}`).join(', '));
+  } catch (e) {
+    console.error('SNAPSHOT: failed to write file', e.message);
+  }
+  cleanupOldSnapshots();
+}
+
+function cleanupOldSnapshots() {
+  try {
+    const files = fs.readdirSync(SNAPSHOTS_DIR).filter(f => f.endsWith('.json')).sort();
+    const excess = files.length - SNAPSHOT_RETENTION_DAYS;
+    if (excess > 0) {
+      files.slice(0, excess).forEach(f => fs.unlinkSync(path.join(SNAPSHOTS_DIR, f)));
+    }
+  } catch (e) {}
+}
+
+function listSnapshotDates() {
+  try {
+    return fs.readdirSync(SNAPSHOTS_DIR).filter(f => f.endsWith('.json')).map(f => f.replace('.json', '')).sort();
+  } catch (e) {
+    return [];
+  }
+}
+
+function loadSnapshot(date) {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(SNAPSHOTS_DIR, `${date}.json`), 'utf8'));
+  } catch (e) {
+    return null;
+  }
+}
+
+function diffSnapshots(fromSnap, toSnap) {
+  const result = { operators: {}, totalAdded: 0, totalRemoved: 0 };
+  const opNames = new Set([...Object.keys(fromSnap.operators || {}), ...Object.keys(toSnap.operators || {})]);
+  opNames.forEach(op => {
+    const fromList = fromSnap.operators[op] || [];
+    const toList = toSnap.operators[op] || [];
+    const fromIds = new Set(fromList.map(s => s.id));
+    const toIds = new Set(toList.map(s => s.id));
+    const added = toList.filter(s => !fromIds.has(s.id));
+    const removed = fromList.filter(s => !toIds.has(s.id));
+    result.operators[op] = { added, removed, countBefore: fromList.length, countAfter: toList.length };
+    result.totalAdded += added.length;
+    result.totalRemoved += removed.length;
+  });
+  return result;
+}
+
+// Take one snapshot shortly after boot (in case none exists yet for today),
+// then schedule daily snapshots at SNAPSHOT_HOUR_UTC every day after that.
+setTimeout(takeSnapshot, 15000); // small delay to let first E2GO sweep get going
+function msUntilNextSnapshotHour() {
+  const now = new Date();
+  const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), SNAPSHOT_HOUR_UTC, 0, 0, 0));
+  if (next <= now) next.setUTCDate(next.getUTCDate() + 1);
+  return next - now;
+}
+function scheduleDailySnapshot() {
+  setTimeout(() => {
+    takeSnapshot();
+    setInterval(takeSnapshot, 24 * 60 * 60 * 1000);
+  }, msUntilNextSnapshotHour());
+}
+scheduleDailySnapshot();
 
 // ---- Zynetic ----
 async function fetchZynetic() {
@@ -253,9 +411,34 @@ http.createServer(async (req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ status: 'ok', e2goCacheAge: e2goLastFetch ? Date.now() - e2goLastFetch : null }));
 
+  } else if (req.url.startsWith('/updates')) {
+    const url = new URL(req.url, `http://localhost`);
+    const dates = listSnapshotDates();
+    if (dates.length < 2 && !(url.searchParams.get('from') && url.searchParams.get('to'))) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Not enough snapshots yet — need at least two days of history. Available dates so far: ' + JSON.stringify(dates) }));
+      return;
+    }
+    const toDate = url.searchParams.get('to') || dates[dates.length - 1];
+    const fromDate = url.searchParams.get('from') || dates[dates.length - 2];
+    const fromSnap = loadSnapshot(fromDate);
+    const toSnap = loadSnapshot(toDate);
+    if (!fromSnap || !toSnap) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Snapshot not found for requested date(s)', fromDate, toDate, availableDates: dates }));
+      return;
+    }
+    const diff = diffSnapshots(fromSnap, toSnap);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ from: fromDate, to: toDate, ...diff }));
+
+  } else if (req.url.startsWith('/snapshots')) {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ availableDates: listSnapshotDates() }));
+
   } else {
     res.writeHead(404);
-    res.end('Use /ion, /uaev, /e2go, /zynetic, /dewa, or /health');
+    res.end('Use /ion, /uaev, /e2go, /zynetic, /dewa, /updates, /snapshots, or /health');
   }
 }).listen(PORT, () => {
   console.log(`Combined proxy running on port ${PORT}`);
@@ -265,5 +448,7 @@ http.createServer(async (req, res) => {
   console.log('  E2GO:    /e2go');
   console.log('  Zynetic: /zynetic');
   console.log('  DEWA:    /dewa');
+  console.log('  Updates: /updates (compares last two daily snapshots)');
+  console.log('  Snapshots: /snapshots (lists available dates)');
   console.log('  Health:  /health');
 });
